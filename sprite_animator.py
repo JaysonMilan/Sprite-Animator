@@ -29,7 +29,7 @@ Keyboard shortcuts:
     Esc         Quit
 """
 
-import sys, os, json, math, hashlib, copy
+import sys, os, json, math, hashlib, copy, time
 import pygame
 from pygame.locals import *
 
@@ -300,6 +300,7 @@ class SpriteAnimator:
         # palette swap
         self._remap_from    = None
         self._remap_to      = None
+        self._sheet_backup  = None   # for undo palette swap
 
         # compare
         self.compare_sheet  = None
@@ -316,6 +317,13 @@ class SpriteAnimator:
         self.bg_sprite      = None
         self.bg_sprite_path = None
 
+        # project file
+        self.project_path   = None
+
+        # recent files
+        self._recent_file   = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".recent")
+        self.recent_files   = self._load_recent()
+
         # UI
         self.active_tab  = 0
         self._msg        = ""
@@ -325,6 +333,27 @@ class SpriteAnimator:
 
         if path:
             self.load(path)
+
+    # ── recent files ─────────────────────────────────────────────────────────
+    def _load_recent(self):
+        try:
+            if os.path.exists(self._recent_file):
+                with open(self._recent_file, "r") as f:
+                    return [l.strip() for l in f if l.strip() and os.path.exists(l.strip())][:8]
+        except Exception:
+            pass
+        return []
+
+    def _save_recent(self, path):
+        path = os.path.abspath(path)
+        self.recent_files = [p for p in self.recent_files if p != path]
+        self.recent_files.insert(0, path)
+        self.recent_files = self.recent_files[:8]
+        try:
+            with open(self._recent_file, "w") as f:
+                f.write("\n".join(self.recent_files))
+        except Exception:
+            pass
 
     # ── loading ───────────────────────────────────────────────────────────────
     def load(self, path):
@@ -339,6 +368,8 @@ class SpriteAnimator:
             self._origins = {}; self._hitboxes = {}
             self.anim_states = []; self.active_anim = -1
             self.flip_h = False; self.flip_v = False
+            self._sheet_backup = None
+            self._save_recent(path)
             w, h = self.sheet.get_size()
             self.end_inp.value = self.total_frames - 1
             self.end_inp._buf  = str(self.end_inp.value)
@@ -594,6 +625,138 @@ class SpriteAnimator:
                 pass
         self.show_msg(f"Batch: {count} GIFs exported from {os.path.basename(folder)}")
 
+    # ── project save/load ───────────────────────────────────────────────────
+    def save_project(self):
+        if not self.sheet_path:
+            self.show_msg("No sheet loaded", error=True); return
+        out = self.project_path
+        if not out:
+            out = os.path.splitext(self.sheet_path)[0] + ".sproj"
+        data = {
+            "version": "4.0",
+            "sheet_path": os.path.abspath(self.sheet_path),
+            "grid": {
+                "cols": self.cols_inp.value,
+                "rows": self.rows_inp.value,
+                "frames": self.frames_inp.value,
+            },
+            "playback": {
+                "fps": self.fps_inp.value,
+                "range_start": self.start_inp.value,
+                "range_end": self.end_inp.value,
+                "play_mode": self.play_mode,
+            },
+            "flip_h": self.flip_h,
+            "flip_v": self.flip_v,
+            "sprite_prefix": self.sprite_prefix,
+            "origins": {str(k): list(v) for k, v in self._origins.items()},
+            "hitboxes": {str(k): list(v) for k, v in self._hitboxes.items()},
+            "animations": [a.to_dict() for a in self.anim_states],
+            "frame_order": self._frame_order if self._frame_order else [],
+            "trim_computed": self._trim_computed,
+        }
+        with open(out, "w") as f:
+            json.dump(data, f, indent=2)
+        self.project_path = out
+        self.show_msg(f"Project saved: {os.path.basename(out)}")
+
+    def load_project(self, path=None):
+        if not path:
+            if not HAS_TK: return
+            root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Open project",
+                filetypes=[("Sprite Project", "*.sproj"), ("All", "*.*")])
+            root.destroy()
+        if not path: return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            sheet_path = data.get("sheet_path", "")
+            if not os.path.exists(sheet_path):
+                # Try relative to project file
+                sheet_path = os.path.join(os.path.dirname(path), os.path.basename(sheet_path))
+            if not os.path.exists(sheet_path):
+                self.show_msg(f"Sheet not found: {sheet_path}", error=True); return
+
+            # Load grid settings first
+            grid = data.get("grid", {})
+            self.cols_inp.value = grid.get("cols", 4); self.cols_inp._buf = str(self.cols_inp.value)
+            self.rows_inp.value = grid.get("rows", 4); self.rows_inp._buf = str(self.rows_inp.value)
+            self.frames_inp.value = grid.get("frames", 16); self.frames_inp._buf = str(self.frames_inp.value)
+
+            # Load sheet
+            self.sheet = pygame.image.load(sheet_path).convert_alpha()
+            self.sheet_path = sheet_path
+            self.project_path = path
+            self._save_recent(path)
+
+            # Playback
+            pb = data.get("playback", {})
+            self.fps_inp.value = pb.get("fps", 12); self.fps_inp._buf = str(self.fps_inp.value)
+            self.start_inp.value = pb.get("range_start", 0); self.start_inp._buf = str(self.start_inp.value)
+            self.end_inp.value = pb.get("range_end", self.total_frames-1); self.end_inp._buf = str(self.end_inp.value)
+            self.play_mode = pb.get("play_mode", 0)
+
+            # State
+            self.flip_h = data.get("flip_h", False)
+            self.flip_v = data.get("flip_v", False)
+            self.sprite_prefix = data.get("sprite_prefix", "sprite_")
+
+            # Origins & hitboxes
+            self._origins = {int(k): tuple(v) for k, v in data.get("origins", {}).items()}
+            self._hitboxes = {int(k): tuple(v) for k, v in data.get("hitboxes", {}).items()}
+
+            # Animation states
+            self.anim_states = []
+            for ad in data.get("animations", []):
+                a = AnimState(ad["name"], ad["start"], ad["end"], ad.get("fps", 12))
+                fd = ad.get("frame_durations", {})
+                a.frame_durations = {int(k): v for k, v in fd.items()}
+                self.anim_states.append(a)
+            self.active_anim = -1
+
+            # Frame order
+            fo = data.get("frame_order", [])
+            self._frame_order = fo if fo else []
+            self._undo_stack = []
+
+            # Re-trim if it was computed
+            self._trim_computed = False; self._trim_rects = []; self._trim_union = None
+            if data.get("trim_computed", False):
+                self.compute_trim()
+
+            self._palette = []; self._palette_frame = -1
+            self._duplicates = set(); self._dupes_hash = ""
+            self._sheet_backup = None
+            self.frame = 0; self.acc = 0; self.direction = 1; self.done_once = False
+            self.zoom_to_fit()
+            n_anims = len(self.anim_states)
+            n_origins = len(self._origins)
+            n_hb = len(self._hitboxes)
+            self.show_msg(f"Project loaded: {n_anims} anims, {n_origins} origins, {n_hb} hitboxes")
+        except Exception as ex:
+            self.show_msg(f"Load failed: {ex}", error=True)
+
+    # ── copy origin/hitbox to all ─────────────────────────────────────────────
+    def copy_origin_to_all(self):
+        if self.frame not in self._origins:
+            self.show_msg("Set origin on current frame first", error=True); return
+        origin = self._origins[self.frame]
+        n = self.display_total
+        for i in range(n):
+            self._origins[i] = origin
+        self.show_msg(f"Origin {origin} copied to all {n} frames")
+
+    def copy_hitbox_to_all(self):
+        if self.frame not in self._hitboxes:
+            self.show_msg("Set hitbox on current frame first", error=True); return
+        hb = self._hitboxes[self.frame]
+        n = self.display_total
+        for i in range(n):
+            self._hitboxes[i] = hb
+        self.show_msg(f"Hitbox copied to all {n} frames")
+
     # ── analysis ──────────────────────────────────────────────────────────────
     def compute_palette(self):
         if not self.sheet or not HAS_PIL: return
@@ -680,6 +843,7 @@ class SpriteAnimator:
     def apply_palette_swap(self):
         if not self.sheet or not self._remap_from or not self._remap_to:
             self.show_msg("Set From/To colors first", error=True); return
+        self._sheet_backup = self.sheet.copy()
         fr, fg, fb = self._remap_from
         tr, tg, tb = self._remap_to
         px = pygame.surfarray.pixels3d(self.sheet)
@@ -691,7 +855,15 @@ class SpriteAnimator:
                 (alpha > 20))
         px[mask] = [tr, tg, tb]
         del px, alpha
-        self.show_msg(f"Swapped ({fr},{fg},{fb}) -> ({tr},{tg},{tb})")
+        self.show_msg(f"Swapped ({fr},{fg},{fb}) -> ({tr},{tg},{tb})  [Ctrl+Z to undo]")
+
+    def undo_palette_swap(self):
+        if self._sheet_backup:
+            self.sheet = self._sheet_backup
+            self._sheet_backup = None
+            self.show_msg("Palette swap undone")
+        else:
+            self.show_msg("No swap to undo", error=True)
 
     # ── animation states ─────────────────────────────────────────────────────
     def add_anim_state(self):
@@ -818,10 +990,35 @@ class SpriteAnimator:
             draw_text(self.screen, self.font_sm, "No file loaded", (px+12, y), TEXT_DIM)
         y += 18
 
-        ob = pygame.Rect(px+12, y, PANEL_W-24, 28)
-        draw_button(self.screen, self.font, ob, "Open  (O)",
+        # File buttons row
+        bw_file = (PANEL_W - 30) // 3
+        ob = pygame.Rect(px+12, y, bw_file, 28)
+        draw_button(self.screen, self.font_sm, ob, "Open (O)",
                     hovered=ob.collidepoint(mx,my))
-        self._btn("open", ob); y += 36
+        self._btn("open", ob)
+        sv = pygame.Rect(px+15+bw_file, y, bw_file, 28)
+        draw_button(self.screen, self.font_sm, sv, "Save",
+                    hovered=sv.collidepoint(mx,my), accent=GREEN)
+        self._btn("save_proj", sv)
+        ld = pygame.Rect(px+18+bw_file*2, y, bw_file, 28)
+        draw_button(self.screen, self.font_sm, ld, "Load",
+                    hovered=ld.collidepoint(mx,my), accent=ORANGE)
+        self._btn("load_proj", ld)
+        y += 34
+
+        # Recent files
+        if self.recent_files:
+            draw_text(self.screen, self.font_sm, "Recent:", (px+12, y), TEXT_DIM)
+            y += 16
+            for ri, rp in enumerate(self.recent_files[:4]):
+                rname = os.path.basename(rp)
+                if len(rname) > 32: rname = rname[:29] + "..."
+                rr = pygame.Rect(px+12, y, PANEL_W-24, 18)
+                col = ACCENT if rr.collidepoint(mx, my) else TEXT_DIM
+                draw_text(self.screen, self.font_sm, rname, (px+14, y), col)
+                self._btn(f"recent_{ri}", rr)
+                y += 18
+            y += 4
 
         sep(self.screen, px+8, y, PANEL_W-16); y += 10
 
@@ -1093,6 +1290,17 @@ class SpriteAnimator:
             hx, hy, hw, hh = self._hitboxes[self.frame]
             draw_text(self.screen, self.font_sm, f"Hitbox: ({hx},{hy}) {hw}x{hh}",
                       (px+12, y), CYAN); y += 18
+
+        # Copy to all buttons
+        hw3 = (PANEL_W - 36) // 2
+        co_r = pygame.Rect(px+12, y, hw3, 26)
+        ch_r = pygame.Rect(px+18+hw3, y, hw3, 26)
+        draw_button(self.screen, self.font_sm, co_r, "Origin -> All",
+                    hovered=co_r.collidepoint(mx,my), accent=CYAN)
+        draw_button(self.screen, self.font_sm, ch_r, "Hitbox -> All",
+                    hovered=ch_r.collidepoint(mx,my), accent=CYAN)
+        self._btn("copy_origin", co_r); self._btn("copy_hb", ch_r)
+        y += 32
         sep(self.screen, px+8, y, PANEL_W-16); y += 10
 
         # Palette swap
@@ -1114,10 +1322,17 @@ class SpriteAnimator:
                         hovered=to_r.collidepoint(mx,my))
         self._btn("remap_from", from_r); self._btn("remap_to", to_r)
         y += 34
-        sw_r = pygame.Rect(px+12, y, PANEL_W-24, 28)
-        draw_button(self.screen, self.font, sw_r, "Apply Swap",
+        hw4 = (PANEL_W - 36) // 2
+        sw_r = pygame.Rect(px+12, y, hw4, 28)
+        draw_button(self.screen, self.font_sm, sw_r, "Apply Swap",
                     hovered=sw_r.collidepoint(mx,my), accent=PURPLE)
-        self._btn("apply_swap", sw_r); y += 36
+        self._btn("apply_swap", sw_r)
+        us_r = pygame.Rect(px+18+hw4, y, hw4, 28)
+        draw_button(self.screen, self.font_sm, us_r, "Undo Swap",
+                    hovered=us_r.collidepoint(mx,my), accent=ACCENT2,
+                    active=bool(self._sheet_backup))
+        self._btn("undo_swap", us_r)
+        y += 36
         sep(self.screen, px+8, y, PANEL_W-16); y += 10
 
         # Compare + BG sprite
@@ -1386,7 +1601,9 @@ class SpriteAnimator:
         B = self._all_btns
         def hit(n): return n in B and B[n].collidepoint(mx,my)
 
-        if hit("open"):     p = open_file(); p and self.load(p)
+        if hit("open"):      p = open_file(); p and self.load(p)
+        elif hit("save_proj"): self.save_project()
+        elif hit("load_proj"): self.load_project()
         elif hit("auto"):   self.auto_detect()
         elif hit("onion"):  self.onion = not self.onion
         elif hit("pgrid"):  self.show_grid = not self.show_grid
@@ -1425,6 +1642,9 @@ class SpriteAnimator:
         elif hit("remap_from"): self._remap_from = pick_color(self._remap_from or (255,0,0))
         elif hit("remap_to"):   self._remap_to = pick_color(self._remap_to or (0,0,255))
         elif hit("apply_swap"): self.apply_palette_swap()
+        elif hit("undo_swap"):  self.undo_palette_swap()
+        elif hit("copy_origin"): self.copy_origin_to_all()
+        elif hit("copy_hb"):    self.copy_hitbox_to_all()
         elif hit("compare"):
             if self.compare_sheet: self.show_compare = not self.show_compare
             else: self.load_compare()
@@ -1453,6 +1673,15 @@ class SpriteAnimator:
         for i in range(len(self.anim_states)):
             if hit(f"anim_play_{i}"): self.play_anim_state(i)
             if hit(f"anim_del_{i}"): self.delete_anim_state(i)
+
+        # Recent files
+        for i in range(min(4, len(self.recent_files))):
+            if hit(f"recent_{i}"):
+                rp = self.recent_files[i]
+                if rp.endswith(".sproj"):
+                    self.load_project(rp)
+                else:
+                    self.load(rp)
 
         # Viewport clicks (hitbox editing)
         sw, sh_s = self.screen.get_size()
@@ -1511,7 +1740,10 @@ class SpriteAnimator:
         elif key == K_c:
             if self.compare_sheet: self.show_compare = not self.show_compare
             else: self.load_compare()
-        elif key == K_z and ctrl: self.undo_reorder()
+        elif key == K_s and ctrl: self.save_project()
+        elif key == K_z and ctrl:
+            if self._sheet_backup: self.undo_palette_swap()
+            else: self.undo_reorder()
         elif key == K_DELETE: self.delete_frame()
         elif key == K_SPACE:
             self.playing = not self.playing
